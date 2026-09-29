@@ -10,6 +10,7 @@ from config import (
     GROQ_API_KEY,
     GEMINI_API_KEY,
     GROQ_MODELS,
+    GROQ_VISION_MODELS,
     GEMINI_MODELS,
     HTTP_TIMEOUT_SECONDS,
     MAX_RETRIES_PER_MODEL,
@@ -30,18 +31,79 @@ def _is_transient_error(err_str: str) -> bool:
     lower_err = err_str.lower()
     return any(m in lower_err for m in markers)
 
+def _heuristic_repair_json(text: str) -> Optional[Dict[str, Any]]:
+    """
+    Attempts balanced-delimiter repair for truncated JSON outputs.
+    Closes unterminated string quotes and unclosed arrays/objects in proper reverse order.
+    """
+    s = text.strip()
+    # Find start of JSON structure
+    first_brace = s.find("{")
+    first_bracket = s.find("[")
+    valid_starts = [i for i in (first_brace, first_bracket) if i != -1]
+    if not valid_starts:
+        return None
+    start_idx = min(valid_starts)
+    s = s[start_idx:].rstrip()
+
+    # Track open delimiters while ignoring escaped characters
+    in_string = False
+    escape = False
+    stack = []
+    
+    for ch in s:
+        if escape:
+            escape = False
+            continue
+        if ch == "\\":
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch in ("{", "["):
+            stack.append(ch)
+        elif ch == "}":
+            if stack and stack[-1] == "{":
+                stack.pop()
+        elif ch == "]":
+            if stack and stack[-1] == "[":
+                stack.pop()
+
+    candidate = s
+    if in_string:
+        candidate += '"'
+
+    # Close unclosed structures in reverse order
+    for delimiter in reversed(stack):
+        if delimiter == "{":
+            candidate += "}"
+        elif delimiter == "[":
+            candidate += "]"
+
+    try:
+        data = json.loads(candidate)
+        return data if isinstance(data, dict) else {"data": data}
+    except Exception:
+        return None
+
 def _clean_and_heal_json(raw_text: str) -> tuple[bool, Optional[Dict[str, Any]], str]:
     """
-    Strips markdown code fences and attempts at most one heuristic repair for truncated braces.
-    Fails loud if valid JSON cannot be restored to protect data correctness.
+    Strips markdown code fences (including unclosed fences) and conversational chatter.
+    Attempts balanced delimiter repair if the JSON was cut short by max_tokens.
     """
     text = raw_text.strip()
-    # Strip markdown block if present
-    match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
-    if match:
-        text = match.group(1).strip()
+    if not text:
+        return False, None, "Empty LLM response"
 
-    # Pass 1: Standard parse
+    # 1. Strip markdown fences (both closed and unclosed/truncated fences)
+    fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)(?:```|$)", text)
+    if fence_match and fence_match.group(1).strip():
+        text = fence_match.group(1).strip()
+
+    # 2. Pass 1: Standard parse
     try:
         data = json.loads(text)
         if isinstance(data, dict):
@@ -50,20 +112,23 @@ def _clean_and_heal_json(raw_text: str) -> tuple[bool, Optional[Dict[str, Any]],
     except json.JSONDecodeError:
         pass
 
-    # Pass 2: Single conservative heuristic repair for truncated closing brace
-    repaired = text.rstrip()
-    if not repaired.endswith("}"):
-        last_brace = repaired.rfind("}")
-        if last_brace != -1:
-            repaired = repaired[:last_brace + 1]
-        else:
-            repaired += "}"
+    # 3. Pass 2: Extract substring between first JSON open and last JSON close
+    first_brace = text.find("{")
+    last_brace = text.rfind("}")
+    if first_brace != -1 and last_brace > first_brace:
+        snippet = text[first_brace:last_brace + 1]
         try:
-            data = json.loads(repaired)
+            data = json.loads(snippet)
             if isinstance(data, dict):
                 return True, data, ""
-        except Exception:
+            return True, {"data": data}, ""
+        except json.JSONDecodeError:
             pass
+
+    # 4. Pass 3: Balanced delimiter repair for truncated tokens
+    repaired_data = _heuristic_repair_json(text)
+    if repaired_data is not None:
+        return True, repaired_data, ""
 
     return False, None, f"Failed to parse clean JSON: {raw_text[:200]}"
 
@@ -80,6 +145,11 @@ def call_llm(
     Executes an LLM call across Groq with automatic cascade to Gemini.
     Retries only on transient errors (429/503/timeout), with capped backoff.
     """
+    # Safeguard for Groq JSON mode requirement: prompt must contain 'json'
+    active_sys_prompt = system_prompt
+    if json_mode and "json" not in (active_sys_prompt or "").lower() and "json" not in user_prompt.lower():
+        active_sys_prompt = (active_sys_prompt + "\nOutput strictly in valid JSON format.") if active_sys_prompt else "Output strictly in valid JSON format."
+
     # -----------------------------------------------------------------------
     # 1. Tier 1: Groq Cascade
     # -----------------------------------------------------------------------
@@ -88,7 +158,10 @@ def call_llm(
             from groq import Groq
             groq_client = Groq(api_key=GROQ_API_KEY, timeout=HTTP_TIMEOUT_SECONDS)
 
-            for model_id in GROQ_MODELS:
+            # Use vision models if an image is provided; otherwise text models
+            candidate_models = GROQ_VISION_MODELS if image_bytes else GROQ_MODELS
+
+            for model_id in candidate_models:
                 for attempt in range(MAX_RETRIES_PER_MODEL):
                     try:
                         # Construct content (text or multimodal)
@@ -101,12 +174,14 @@ def call_llm(
                         else:
                             user_content = user_prompt
 
+                        messages = []
+                        if active_sys_prompt:
+                            messages.append({"role": "system", "content": active_sys_prompt})
+                        messages.append({"role": "user", "content": user_content})
+
                         kwargs: Dict[str, Any] = {
                             "model": model_id,
-                            "messages": [
-                                {"role": "system", "content": system_prompt},
-                                {"role": "user", "content": user_content}
-                            ],
+                            "messages": messages,
                             "temperature": temperature,
                             "max_tokens": max_tokens,
                         }
@@ -171,14 +246,15 @@ def call_llm(
                         contents = []
                         if image_bytes:
                             contents.append(types.Part.from_bytes(data=image_bytes, mime_type=mime_type))
-                        
-                        prompt_full = f"{system_prompt}\n\n{user_prompt}" if system_prompt else user_prompt
-                        contents.append(prompt_full)
+                        contents.append(user_prompt)
 
                         config_args: Dict[str, Any] = {
                             "temperature": temperature,
                             "max_output_tokens": max_tokens,
                         }
+                        if active_sys_prompt:
+                            config_args["system_instruction"] = active_sys_prompt
+
                         if json_mode:
                             config_args["response_mime_type"] = "application/json"
 

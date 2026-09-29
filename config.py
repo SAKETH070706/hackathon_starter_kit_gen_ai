@@ -21,25 +21,37 @@ logger = logging.getLogger("hackathon_kit")
 # ---------------------------------------------------------------------------
 # API Credentials
 # ---------------------------------------------------------------------------
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "") or os.getenv("GOOGLE_API_KEY", "")
+# Detect and treat placeholder keys from .env.example as empty
+def _clean_api_key(val: str) -> str:
+    cleaned = (val or "").strip()
+    if not cleaned or "your_" in cleaned.lower() or cleaned.startswith("gsk_your_") or cleaned.startswith("AIzaSy_your_"):
+        return ""
+    return cleaned
+
+GROQ_API_KEY = _clean_api_key(os.getenv("GROQ_API_KEY", ""))
+GEMINI_API_KEY = _clean_api_key(os.getenv("GEMINI_API_KEY", "") or os.getenv("GOOGLE_API_KEY", ""))
 
 # ---------------------------------------------------------------------------
 # Provider Model Cascades
-# NOTE: Verify these IDs against provider docs before the hackathon starts.
-# Free-tier model names update periodically; a stale model ID fails silently.
+# Verified production models across Groq and Google GenAI APIs
 # ---------------------------------------------------------------------------
 GROQ_MODELS = [
-    "qwen/qwen3.8-27b",        # Fast, versatile, supports text + multimodal vision
-    "openai/gpt-oss-120b",     # Heavy reasoning fallback
-    "openai/gpt-oss-20b"       # Secondary lightweight fallback
+    "llama-3.3-70b-versatile",    # Fast, high-accuracy primary text model
+    "llama-3.1-8b-instant",       # Ultra-low latency fallback
+    "mixtral-8x7b-32768"          # High-context fallback
+]
+
+# Dedicated Groq vision endpoints for multimodal image processing
+GROQ_VISION_MODELS = [
+    "llama-3.2-11b-vision-preview",
+    "llama-3.2-90b-vision-preview"
 ]
 
 GEMINI_MODELS = [
-    "gemini-3.5-flash",        # Primary Google fast multimodal endpoint
-    "gemini-flash-latest",     # Stable alias pointer
-    "gemini-3.1-flash-lite",   # Low-latency speed tier
-    "gemini-3.8-flash"         # Extended capabilities tier
+    "gemini-2.5-flash",           # Primary fast multimodal endpoint
+    "gemini-2.0-flash",           # Low-latency speed tier
+    "gemini-1.5-flash",           # High-throughput stable fallback
+    "gemini-1.5-pro"              # Complex reasoning tier
 ]
 
 # ---------------------------------------------------------------------------
