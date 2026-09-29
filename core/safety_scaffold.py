@@ -29,19 +29,24 @@ def scan_for_flags(text: str, patterns: List[str] = None) -> Tuple[bool, str]:
     """
     Tier 0 Deterministic Safety Check.
     Ultra-fast (<5ms) regex scan executed before any vector search or LLM call.
+    Safeguarded against invalid regex patterns.
     Returns: (is_flagged: bool, matched_phrase: str)
     """
     active_patterns = patterns if patterns is not None else DEFAULT_RED_FLAG_PATTERNS
     if not text or not active_patterns:
         return False, ""
 
-    normalized = text.lower().strip()
+    normalized = text.strip()
     for pattern in active_patterns:
-        match = re.search(pattern, normalized)
-        if match:
-            trigger = match.group(0)
-            logger.warning(f"Tier 0 Safety Flag triggered: '{trigger}'")
-            return True, trigger
+        try:
+            match = re.search(pattern, normalized, re.IGNORECASE)
+            if match:
+                trigger = match.group(0)
+                logger.warning(f"Tier 0 Safety Flag triggered: '{trigger}'")
+                return True, trigger
+        except re.error as reg_err:
+            logger.error(f"Invalid regex pattern skipped '{pattern}': {reg_err}")
+            continue
 
     return False, ""
 
@@ -53,6 +58,7 @@ def semantic_check(
     Tier 1 Semantic Safety Check.
     Uses LLM JSON mode for contextual classification (e.g. nuanced queries, idioms, vernacular).
     Distinguishes provider failure (SERVICE_UNAVAILABLE) from clean responses.
+    Safeguards against string booleans ("true"/"false").
     Returns: (is_flagged: bool, reason: str)
     """
     if not text or len(text.strip()) < 3:
@@ -73,7 +79,14 @@ def semantic_check(
         return False, f"SAFETY_CHECK_ERROR: {res.error}"
 
     parsed = res.parsed_json or {}
-    is_flagged = bool(parsed.get("is_flagged", False))
+    raw_flag = parsed.get("is_flagged", False)
+
+    # Normalize string boolean values ("true", "false", "1", "0")
+    if isinstance(raw_flag, str):
+        is_flagged = raw_flag.strip().lower() in ("true", "1", "yes")
+    else:
+        is_flagged = bool(raw_flag)
+
     reason = str(parsed.get("reason", ""))
     if is_flagged:
         logger.warning(f"Tier 1 Semantic Safety Flag triggered: {reason}")
